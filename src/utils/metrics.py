@@ -51,6 +51,7 @@ def speed_score(t_pr, q_pr, t_gt, q_gt, applyThresh=True, rotThresh=0.5, posThre
     t_gt = np.reshape(t_gt, (3,))
     speed_t = err_t / np.sqrt(np.sum(np.square(t_gt)))
     speed_r = np.deg2rad(err_q)
+    speed_q = speed_r
 
     # Check if within threshold
     if applyThresh and err_q < rotThresh:

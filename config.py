@@ -14,9 +14,9 @@ parser.add_argument('--seed',     type=int, default=2021)
 parser.add_argument('--projroot', type=str, default=PROJROOTDIR['linux'])
 parser.add_argument('--dataroot', type=str, default=DATAROOTDIR['linux'])
 parser.add_argument('--dataname', type=str, default='speedplus')
-parser.add_argument('--savedir',  type=str, default='checkpoints/synthetic/krn')
+parser.add_argument('--savedir',  type=str, default='checkpoints/krn/synthetic_full')
 parser.add_argument('--resultfn', type=str, default='')
-parser.add_argument('--logdir',   type=str, default='log/synthetic/krn')
+parser.add_argument('--logdir',   type=str, default='log/krn/synthetic_full')
 parser.add_argument('--pretrained', type=str, default='')
 
 # ------------------------------------------------------------------------------------------

@@ -1,5 +1,40 @@
-# Byte-compiled / optimized / DLL files
 __pycache__/
+*.pyc
+
+# environments
+.env
+.venv/
+venv/
+conda-env/
+*.egg-info/
+
+# training outputs
+checkpoints/
+log/
+logs/
+runs/
+wandb/
+*.log
+
+# datasets
+data/
+datasets/
+speedplusv2/
+SPEED+/
+*.zip
+*.tar
+*.tar.gz
+
+# model weights
+*.pth
+*.pt
+*.ckpt
+*.onnx
+
+# system/editor
+.DS_Store
+.vscode/
+.idea/# Byte-compiled / optimized / DLL files
 *.pyc
 *.py[cod]
 *$py.class
