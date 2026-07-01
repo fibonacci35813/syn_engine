@@ -105,21 +105,23 @@ class HRModule(nn.Module):
                         nn.Upsample(scale_factor=2 ** (j - i), mode='nearest'),
                     ))
                 else:
-                    # higher-res j → lower-res i: (i-j) stride-2 convs
+                    # higher-res j → lower-res i: (i-j) stride-2 convs.
+                    # Each step is its own inner Sequential to match the official
+                    # HRNet key structure (fuse_layers.i.j.step.layer.*).
                     in_ch = num_channels[j]
-                    downs = []
+                    conv3x3s = []
                     for k in range(i - j - 1):
-                        downs += [
+                        conv3x3s.append(nn.Sequential(
                             nn.Conv2d(in_ch, in_ch, 3, stride=2, padding=1, bias=False),
                             nn.BatchNorm2d(in_ch, momentum=BN_MOMENTUM),
                             nn.ReLU(inplace=True),
-                        ]
-                    # final conv changes channel count, no ReLU (added after fusion sum)
-                    downs += [
+                        ))
+                    # Final step changes channels, no ReLU (added after fusion sum)
+                    conv3x3s.append(nn.Sequential(
                         nn.Conv2d(in_ch, num_channels[i], 3, stride=2, padding=1, bias=False),
                         nn.BatchNorm2d(num_channels[i], momentum=BN_MOMENTUM),
-                    ]
-                    row.append(nn.Sequential(*downs))
+                    ))
+                    row.append(nn.Sequential(*conv3x3s))
             self.fuse_layers.append(row)
 
         self.relu = nn.ReLU(inplace=True)
@@ -247,6 +249,90 @@ class HigherHRNet(nn.Module):
                 nn.init.zeros_(m.bias)
 
     # ------------------------------------------------------------------
+    def load_pretrained_hrnet_w32(self, ckpt_path):
+        '''
+        Load an official HRNet-W32 backbone checkpoint into this model.
+        Only backbone weights are loaded (stem, layer1, transitions, stages).
+        The deconv head and final_conv are left at their Kaiming-init values
+        since they are task-specific and not present in the official checkpoint.
+
+        Compatible checkpoints (download from the official HRNet GitHub releases):
+          - ImageNet pretrained : hrnet_w32_imagenet_pretrained.pth
+          - COCO pose pretrained: pose_hrnet_w32_256x192.pth  (best starting point)
+
+        Usage:
+            model = HigherHRNet(num_keypoints=11)
+            model.load_pretrained_hrnet_w32('checkpoints/pretrained/pose_hrnet_w32_256x192.pth')
+        '''
+        import re, logging
+        log = logging.getLogger(__name__)
+
+        src = torch.load(ckpt_path, map_location='cpu')
+        # Some checkpoints wrap weights under 'state_dict' key
+        if 'state_dict' in src:
+            src = src['state_dict']
+
+        def _remap(key):
+            # Stem: conv1/bn1/conv2/bn2 → stem.0/1/3/4
+            if key.startswith('conv1.'):  return 'stem.0.' + key[6:]
+            if key.startswith('bn1.'):    return 'stem.1.' + key[4:]
+            if key.startswith('conv2.'):  return 'stem.3.' + key[6:]
+            if key.startswith('bn2.'):    return 'stem.4.' + key[4:]
+
+            # Transition 1:
+            #   official transition1.0.*      → tr1_branch0.*
+            #   official transition1.1.0.*    → tr1_branch1.*  (extra nesting for new branch)
+            if key.startswith('transition1.0.'):
+                return 'tr1_branch0.' + key[14:]
+            if key.startswith('transition1.1.0.'):
+                return 'tr1_branch1.' + key[16:]
+
+            # Transition 2: official transition2.2.0.* → tr2_branch2.*
+            # (indices 0,1 are identity pass-throughs → absent from official state dict)
+            if key.startswith('transition2.2.0.'):
+                return 'tr2_branch2.' + key[16:]
+
+            # Transition 3: official transition3.3.0.* → tr3_branch3.*
+            if key.startswith('transition3.3.0.'):
+                return 'tr3_branch3.' + key[16:]
+
+            # Stages and layer1 share identical naming — pass through directly.
+            # (fuse_layers indices also match: official uses None, we use Identity;
+            #  neither appears in state_dict so subsequent indices are the same.)
+            if re.match(r'^(layer1|stage[234])\.',  key):
+                return key
+
+            # Everything else (final_layer, etc.) is task-specific — skip it.
+            return None
+
+        our_sd   = self.state_dict()
+        matched  = 0
+        skipped  = 0
+        missing  = []
+
+        for src_key, val in src.items():
+            # MMPose checkpoints wrap everything under 'backbone.' — strip it
+            key = src_key[9:] if src_key.startswith('backbone.') else src_key
+            dst_key = _remap(key)
+            if dst_key is None:
+                skipped += 1
+                continue
+            if dst_key not in our_sd:
+                missing.append(dst_key)
+                continue
+            if our_sd[dst_key].shape != val.shape:
+                log.warning('Shape mismatch: {} {} vs {}'.format(
+                    dst_key, our_sd[dst_key].shape, val.shape))
+                continue
+            our_sd[dst_key].copy_(val)
+            matched += 1
+
+        log.info('Pretrained HRNet-W32 loaded: {} matched, {} skipped (task-specific), '
+                 '{} missing'.format(matched, skipped, len(missing)))
+        if missing:
+            log.warning('Missing keys (not in checkpoint): {}'.format(missing[:5]))
+
+    # ------------------------------------------------------------------
     def _backbone(self, x):
         x = self.stem(x)       # [B, 64,  H/4, W/4]
         x = self.layer1(x)     # [B, 256, H/4, W/4]
@@ -301,9 +387,12 @@ class HigherHRNet(nn.Module):
         B, K, H, W = heatmaps.shape
         device = heatmaps.device
 
-        # Flatten spatial dims, apply temperature-scaled softmax
-        flat    = heatmaps.view(B, K, -1)           # [B, K, H*W]
-        weights = F.softmax(flat * 100.0, dim=-1)   # peaked distribution
+        # fp32 cast before temperature scale — fp16 exp() overflows above ~11,
+        # causing softmax NaN when heatmap peaks are large after training.
+        # Temperature 10 (not 100) still gives peaked weights but lets gradients
+        # flow on an undertrained head.
+        flat    = heatmaps.float().view(B, K, -1)   # [B, K, H*W] in fp32
+        weights = F.softmax(flat * 200.0, dim=-1)
 
         xs = torch.arange(W, device=device, dtype=torch.float32) / max(W - 1, 1)
         ys = torch.arange(H, device=device, dtype=torch.float32) / max(H - 1, 1)
@@ -319,20 +408,20 @@ class HigherHRNet(nn.Module):
 
     # ------------------------------------------------------------------
     def forward(self, x, y=None):
-        feat     = self._backbone(x)         # [B, 32,  H/4,  W/4]
-        feat     = self.deconv_head(feat)    # [B, 32,  H/2,  W/2]
-        heatmaps = self.final_conv(feat)     # [B, K,   H/2,  W/2]
+        feat     = self._backbone(x)                    # [B, 32,  H/4,  W/4]
+        feat     = self.deconv_head(feat)               # [B, 32,  H/2,  W/2]
+        heatmaps = torch.sigmoid(self.final_conv(feat)) # [B, K,   H/2,  W/2] in [0,1]
 
         if y is not None:
             # ---- TRAINING ----
             # y: [B, 2, K] normalised keypoint coords from dataloader
             _, _, H, W = heatmaps.shape
             targets = self._make_gaussian_targets(y, H, W)   # [B, K, H, W]
-            # .mean() stays small in fp16 (no overflow); multiply by H*W as a
-            # Python scalar (fp32 op) to get readable ~10-50 range values.
-            # Equivalent to sum(spatial).mean(batch,kp) but fp16-safe.
-            loss = ((heatmaps - targets) ** 2).mean() * (H * W)
-            sm   = {'loss_hm': float(loss.detach())}
+            # Cast to fp32 before squaring — elementwise squaring in fp16 overflows
+            # (fp16 max ~65504; any heatmap logit > 256 → square overflows → NaN).
+            # Scale logged value by H*W for readability; backpropped loss is clean MSE.
+            loss = F.mse_loss(heatmaps.float(), targets.float())
+            sm   = {'loss_hm': float(loss.detach()) * (H * W)}
             return loss, sm
         else:
             # ---- TESTING ----

@@ -158,6 +158,11 @@ def main():
     logger.info('   - Total parameters:     {:,}'.format(num_total_parameters(model)))
     logger.info('   - Trainable parameters: {:,}'.format(num_trainable_parameters(model)))
 
+    # Load pretrained HRNet-W32 backbone if provided (before optimizer so it
+    # starts from pretrained values, not Kaiming-random).
+    if cfg.pretrained:
+        model.load_pretrained_hrnet_w32(cfg.pretrained)
+
     optimizer = get_optimizer(cfg, model)
 
     # Resume
@@ -188,6 +193,10 @@ def main():
     cameraMatrix, distCoeffs = load_camera_intrinsics(
         osp.join(cfg.dataroot, cfg.dataname, 'camera.json'))
 
+    # best_perf tracks lowest eR seen so far (lower is better).
+    # Only updated on validation epochs; model_best.pth.tar = lowest-eR checkpoint.
+    best_perf = float('inf') if begin_epoch == 0 else best_perf
+
     # Training loop
     for epoch in range(begin_epoch, cfg.max_epochs):
         train_single_epoch_hrn(
@@ -196,16 +205,17 @@ def main():
 
         lr_scheduler.step()
 
-        # Periodic validation (set --test_epoch N to validate every N epochs)
+        # Periodic validation
+        is_best = False
         if cfg.test_epoch > 0 and (epoch + 1) % cfg.test_epoch == 0:
-            valid_hrn(epoch + 1, cfg, model, test_loader,
-                      cameraMatrix, distCoeffs, corners3D, writer, device)
-
-        # Save checkpoint every epoch (always mark as best to mirror KRN behaviour)
-        perf    = epoch + 1
-        is_best = perf > best_perf
-        if is_best:
-            best_perf = perf
+            perf = valid_hrn(epoch + 1, cfg, model, test_loader,
+                             cameraMatrix, distCoeffs, corners3D, writer, device)
+            eR = perf['eR'].avg
+            if eR < best_perf:
+                best_perf = eR
+                is_best   = True
+            logger.info('Epoch {:03d}: eR={:.3f} deg  best={:.3f} deg'.format(
+                epoch + 1, eR, best_perf))
 
         save_checkpoint({
             'epoch':      epoch + 1,

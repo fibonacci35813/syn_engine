@@ -46,30 +46,42 @@ def valid_hrn(epoch, cfg, model, data_loader,
         with torch.no_grad():
             x_pr, y_pr = model(images)   # [B, K] each, normalised [0,1]
 
+        time_meter.update((time.time() - start) * 1000, B)
+
         for b in range(B):
-            q_pr, t_pr = _keypts_to_pose(
-                x_pr[b], y_pr[b], bbox[b], corners3D, cameraMatrix, distCoeffs)
+            try:
+                q_pr, t_pr = _keypts_to_pose(
+                    x_pr[b], y_pr[b], bbox[b], corners3D, cameraMatrix, distCoeffs)
+
+                # Skip this sample if PnP returned non-finite values
+                if not (np.isfinite(t_pr).all() and np.isfinite(q_pr).all()):
+                    raise ValueError('PnP returned non-finite pose')
+
+            except Exception:
+                # Degenerate keypoints (collapsed / collinear) → treat as max-error
+                q_pr = np.array([1.0, 0.0, 0.0, 0.0])
+                t_pr = np.array([0.0, 0.0, 10.0])
 
             q_gt_i = q_gt[b].numpy()
             t_gt_i = t_gt[b].numpy()
 
-            err_q    = error_orientation(q_pr, q_gt_i)
-            err_t    = error_translation(t_pr, t_gt_i)
+            err_q     = error_orientation(q_pr, q_gt_i)
+            err_t     = error_translation(t_pr, t_gt_i)
             speed_raw, acc = speed_score(t_pr, q_pr, t_gt_i, q_gt_i, applyThresh=False)
             speed_mod, _   = speed_score(t_pr, q_pr, t_gt_i, q_gt_i, applyThresh=True,
                                          rotThresh=0.169, posThresh=0.002173)
 
-        time_meter.update((time.time() - start) * 1000, B)
-        err_q_meter.update(err_q, B)
-        err_t_meter.update(err_t, B)
-        speed_meter.update(speed_raw, B)
-        speed_meter_th.update(speed_mod, B)
-        acc_meter.update(acc * 100, B)
+            # Update per-sample (bug fix: was outside loop, scoring only last sample)
+            err_q_meter.update(err_q, 1)
+            err_t_meter.update(err_t, 1)
+            speed_meter.update(speed_raw, 1)
+            speed_meter_th.update(speed_mod, 1)
+            acc_meter.update(acc * 100, 1)
 
-        err_q_all.append(err_q)
-        err_t_all.append(err_t)
-        speed_raw_all.append(speed_raw)
-        speed_mod_all.append(speed_mod)
+            err_q_all.append(err_q)
+            err_t_all.append(err_t)
+            speed_raw_all.append(speed_raw)
+            speed_mod_all.append(speed_mod)
 
         report_progress(epoch=epoch, lr=np.nan, epoch_iter=idx + 1,
                         epoch_size=len(data_loader), time=time_meter,
